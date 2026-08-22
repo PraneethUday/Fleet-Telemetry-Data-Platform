@@ -1,0 +1,31 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local lakehouse — regenerate with `make generate`, never commit data
+data/
+!data/.gitkeep
+
+# Secrets / env
+.env
+.env.local
+*.pem
+
+# Prefect
+.prefect/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.next/
+frontend/build/
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

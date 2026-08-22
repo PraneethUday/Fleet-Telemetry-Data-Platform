@@ -1,0 +1,27 @@
+# Runtime pins for the FastAPI read API ONLY.
+#
+# Why this file exists at all instead of reusing the repo-root requirements.txt:
+# the root file pins prefect, which drags in griffe, orjson, a SQLAlchemy stack
+# and a server of its own — roughly 60 extra packages the API never imports. The
+# API is a read path; orchestration is a different process with a different
+# lifecycle. Keeping the dependency trees apart means the API image pulls in
+# seconds, which matters directly on Azure Container Apps: with scale-to-zero
+# the image pull is part of the cold start the first user sits through. It also
+# shrinks the CVE surface of a container that is the only one exposed to the
+# internet.
+#
+# Consequence to respect: nothing under backend/ may import pipeline.flows.*,
+# because that would import prefect and only fail inside the built image. The
+# API imports pipeline.config, pipeline.storage, pipeline.schemas and
+# pipeline.warehouse — all prefect-free.
+
+fastapi==0.141.1
+# [standard] pulls uvloop/httptools — the production server loop, not the pure
+# Python fallback. Same extra locally and in the image so they behave alike.
+uvicorn[standard]==0.52.4
+duckdb==1.5.5
+pandas==2.3.3
+# DuckDB reads the Parquet itself, but pyarrow is what backs DataFrame exchange
+# and it is the same pin the pipeline uses, so one lake writes what one API reads.
+pyarrow==25.0.1
+python-dotenv==1.2.3

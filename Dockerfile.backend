@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Backend image — the FastAPI read API over the gold layer.
+#
+# Deliberately a SEPARATE, smaller image from Dockerfile.etl even though both
+# contain the pipeline package. The ETL needs prefect and duckdb-sized wheels;
+# the API needs neither Prefect nor pandas' full write path. Keeping them apart
+# means the API image pulls faster, and on Container Apps with scale-to-zero
+# the image pull is part of the cold-start the first user waits through.
+#
+# Unlike the ETL image this one is a long-running server: it stays up, listens,
+# and is terminated by the platform rather than exiting on its own.
+# ---------------------------------------------------------------------------
+
+
+# --- stage 1: build the virtualenv -----------------------------------------
+FROM python:3.12-slim AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Same reasoning as Dockerfile.etl: a throwaway builder stage so that a future
+# sdist-only dependency can be compiled with a toolchain that never reaches the
+# runtime image, and so pip's caches stay out of the shipped layers.
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+# --- stage 2: runtime -------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
+
+COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
+
+WORKDIR /app
+
+# The API imports pipeline.config / pipeline.storage / pipeline.warehouse to
+# read the lake, so the pipeline package ships here too — but none of the
+# Prefect flow machinery is ever imported at request time.
+COPY --chown=appuser:appuser pipeline/ ./pipeline/
+COPY --chown=appuser:appuser backend/ ./backend/
+
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
+
+ENV HOME=/home/appuser \
+    LAKE_BACKEND=local \
+    LAKE_LOCAL_ROOT=/app/data \
+    BRONZE_PREFIX=raw \
+    SILVER_PREFIX=silver \
+    GOLD_PREFIX=gold
+
+# Where the FastAPI instance lives. Overridable at build time
+# (--build-arg APP_MODULE=...) or at run time (-e APP_MODULE=...) so that a
+# rename of the backend package does not require editing this file.
+ARG APP_MODULE=backend.app.main:app
+ENV APP_MODULE=${APP_MODULE}
+
+# The listen port comes from the environment, defaulting to 8000. Hardcoding a
+# port is the classic way to break ingress: whatever the platform sets PORT to
+# has to match the Container App's --target-port, and a literal 8000 in the
+# CMD silently ignores it. Reading ${PORT:-8000} makes the container correct
+# both locally (no PORT set) and behind an ingress that sets one.
+ENV PORT=8000
+EXPOSE 8000
+
+USER appuser
+
+# `exec` matters: without it the shell stays PID 1 and swallows SIGTERM, so
+# the platform's graceful-shutdown window expires and the replica is SIGKILLed
+# mid-request. With exec, uvicorn is PID 1 and drains connections properly.
+#
+# --host 0.0.0.0 because binding to localhost inside a container makes the port
+# unreachable from outside it, which looks exactly like a crashed app.
+CMD ["sh", "-c", "exec uvicorn \"$APP_MODULE\" --host 0.0.0.0 --port \"${PORT:-8000}\""]

@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# ETL image — the Prefect bronze -> silver -> gold flows.
+#
+# This image is a BATCH JOB, not a server. It starts, transforms whatever is in
+# the lake, and exits 0. That is the whole reason it can be deployed as an
+# Azure Container Apps *Job* on a cron trigger instead of a Container App:
+# a Job bills only for the seconds an execution is actually running, while an
+# always-on app with min-replicas >= 1 bills around the clock whether or not it
+# is doing anything. See docs/COST.md — it is the single biggest free-tier
+# decision in the project.
+#
+# There is deliberately no HEALTHCHECK and no EXPOSE: nothing ever connects to
+# this container. The only signal that matters is the process exit code, which
+# is what Container Apps uses to mark an execution Succeeded or Failed.
+# ---------------------------------------------------------------------------
+
+
+# --- stage 1: build the virtualenv -----------------------------------------
+FROM python:3.12-slim AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Everything installs from a manylinux wheel on cp312 today (pandas, numpy,
+# pyarrow, duckdb, prefect and their transitive deps all publish one), so no
+# compiler is needed right now. The builder stage earns its keep anyway:
+# if a future dependency drops to an sdist, the fix is to apt-get gcc *here*,
+# and the toolchain is discarded with this stage rather than shipped. It also
+# keeps pip's cache and build metadata out of the runtime layers.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# requirements.txt alone in its own layer: the dependency install is the slow
+# part of the build and it only re-runs when the pin list actually changes,
+# not on every edit to pipeline/.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+# --- stage 2: runtime -------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+# PYTHONUNBUFFERED is not cosmetic in a container: without it Python block-
+# buffers stdout when it is a pipe, so a job that runs for 90 seconds emits
+# nothing to the Container Apps log stream until it exits — and emits nothing
+# at all if it is killed by --replica-timeout. That turns a debuggable failure
+# into a silent one.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# A fixed high UID rather than a name lookup, so the numeric owner is stable
+# no matter how the image is scanned or how a volume is mounted.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
+
+COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
+
+WORKDIR /app
+
+# Only the pipeline package. Not frontend/ (deploys to Vercel), not backend/
+# (its own image), not data/ (the job reads the lake over the network).
+COPY --chown=appuser:appuser pipeline/ ./pipeline/
+
+# pipeline/config.py derives REPO_ROOT as the parent of the pipeline package,
+# so /app is the repo root as far as the code is concerned and the default
+# LAKE_LOCAL_ROOT=./data resolves to /app/data. In Azure LAKE_BACKEND=azure and
+# nothing touches this directory, but creating it writable keeps a local
+# `docker run` of the same image working identically — which is the point of
+# having one image for both environments.
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
+
+# Prefect writes an ephemeral SQLite backing store and its profile under
+# PREFECT_HOME. Default is ~/.prefect, and a non-root user with no writable
+# HOME makes the flow fail at import time rather than at run time — a confusing
+# way to lose a deploy. Pin both explicitly to a directory appuser owns.
+ENV HOME=/home/appuser \
+    PREFECT_HOME=/home/appuser/.prefect
+RUN mkdir -p "$PREFECT_HOME" && chown -R appuser:appuser /home/appuser
+
+# Sane defaults so `docker run` with no -e flags does something useful locally.
+# Azure overrides LAKE_BACKEND=azure plus the credentials, which arrive as
+# Container Apps secrets (secretref:), never as plaintext env vars.
+ENV LAKE_BACKEND=local \
+    LAKE_LOCAL_ROOT=/app/data \
+    BRONZE_PREFIX=raw \
+    SILVER_PREFIX=silver \
+    GOLD_PREFIX=gold
+
+USER appuser
+
+# pipeline/flows/etl_flow.py exposes the "fleet-etl" flow, which runs the
+# silver flow and then the gold flow and returns. Running it as `-m` (rather
+# than a shell wrapper) keeps Python as PID 1, so SIGTERM from Container Apps
+# at --replica-timeout reaches the interpreter directly.
+CMD ["python", "-m", "pipeline.flows.etl_flow"]
